@@ -1,0 +1,84 @@
+name: Centralized Crowdin Trigger (via GH CLI)
+
+on:
+  schedule:
+    - cron: "0 8 * * *" # Daily at 08:00 UTC
+  workflow_dispatch:
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        repo: ${{ fromJSON(vars.GH_REPOS) }}
+
+    steps:
+      - name: Trigger and wait for ${{ matrix.repo }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          OWNER=${{ vars.GH_ORG }}
+          REPO=${{ matrix.repo }}
+
+          echo "📡 Triggering workflow on $OWNER/$REPO"
+
+          # Record the current timestamp
+          START_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Trigger the workflow
+          gh workflow run download-crowdin.yml \
+          --repo "$OWNER/$REPO"
+
+          echo "⏳ Waiting for new run to appear after $START_TIME..."
+
+          for i in {1..20}; do
+          # Get most recent run AFTER trigger
+          RUN_ID=$(gh run list \
+              --repo "$OWNER/$REPO" \
+              --workflow download-crowdin.yml \
+              --limit 5 \
+              --json databaseId,createdAt \
+              --jq "[.[] | select(.createdAt > \"$START_TIME\")][0].databaseId")
+
+          if [ -n "$RUN_ID" ]; then
+              echo "🎯 Found new run ID: $RUN_ID"
+              break
+          fi
+
+          echo "⏱ Waiting 5s for new run to register... ($i/20)"
+          sleep 5
+          done
+
+          if [ -z "$RUN_ID" ]; then
+          echo "❌ Timed out waiting for new workflow run to appear."
+          exit 1
+          fi
+
+          # Now wait for the new run to complete
+          echo "⏳ Monitoring run $RUN_ID until it completes..."
+
+          while true; do
+          STATUS=$(gh run view "$RUN_ID" \
+              --repo "$OWNER/$REPO" \
+              --json status \
+              --jq '.status')
+
+          if [ "$STATUS" = "completed" ]; then
+              CONCLUSION=$(gh run view "$RUN_ID" \
+              --repo "$OWNER/$REPO" \
+              --json conclusion \
+              --jq '.conclusion')
+              echo "✅ Workflow completed with: $CONCLUSION"
+              if [ "$CONCLUSION" != "success" ]; then
+              echo "❌ Workflow failed in $OWNER/$REPO"
+              exit 1
+              fi
+              break
+          fi
+
+          echo "🕓 Still running... sleeping 30s"
+          sleep 30
+          done
